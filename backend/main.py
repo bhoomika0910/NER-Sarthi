@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.data.road_network import load_ner_road_graph
+from backend.dispatch_ai import parse_dispatch_prompt
 from backend.hazard_engine import simulate_weather_impact
 from backend.router import get_safe_resilient_route, get_standard_route
 
@@ -129,6 +130,28 @@ class BlockageReportResponse(BaseModel):
     status: str
 
 
+class DispatchAssistantRequest(BaseModel):
+    """Natural-language emergency dispatch request."""
+
+    user_prompt: str = Field(min_length=1)
+
+
+class DispatchAssistantResponse(BaseModel):
+    """Parsed dispatch constraints and the recommended safe route."""
+
+    origin: str
+    destination: str
+    cargo_priority: Literal["medical", "food", "standard"]
+    hazard_constraint: str | None
+    tactical_summary: str
+    coordinates: list[Coordinates]
+    total_distance_km: float
+    estimated_travel_time_hours: float
+    average_route_risk: float
+    safety_score: float
+    segments_bypassed_due_to_hazard: int
+
+
 # Basic service health endpoint for local development and monitoring.
 @app.get("/api/health")
 def health_check() -> HealthResponse:
@@ -246,4 +269,55 @@ def report_blockage(
         segment_name=request.segment_name,
         reason=request.reason,
         status="BLOCKED_OR_CRITICAL",
+    )
+
+
+@app.post("/api/dispatch-assistant", response_model=DispatchAssistantResponse)
+def dispatch_assistant(
+    request: DispatchAssistantRequest,
+) -> DispatchAssistantResponse:
+    """Parse a conversational request and calculate its safe route."""
+    parsed = parse_dispatch_prompt(request.user_prompt)
+    if not parsed["origin"] or not parsed["destination"]:
+        raise HTTPException(
+            status_code=422,
+            detail="Please specify a known origin and destination waypoint",
+        )
+    if parsed["origin"] not in road_graph or parsed["destination"] not in road_graph:
+        raise HTTPException(
+            status_code=404,
+            detail="Origin or destination waypoint was not found",
+        )
+
+    try:
+        route = get_safe_resilient_route(
+            road_graph, parsed["origin"], parsed["destination"]
+        )
+    except nx.NetworkXNoPath as error:
+        raise HTTPException(
+            status_code=409,
+            detail="No safe route is available for this dispatch",
+        ) from error
+
+    priority_message = {
+        "medical": "Medical-priority cargo is being given a resilient route.",
+        "food": "Food-priority cargo is being given a resilient route.",
+        "standard": "Standard cargo is being given a resilient route.",
+    }[parsed["cargo_priority"]]
+    hazard_message = (
+        f" Constraint applied: {parsed['hazard_constraint']}."
+        if parsed["hazard_constraint"]
+        else " No additional hazard constraint was detected."
+    )
+    tactical_summary = (
+        f"Dispatching from {parsed['origin']} to {parsed['destination']}. "
+        f"{priority_message}{hazard_message} "
+        f"Safe route distance is {route['total_distance_km']:.1f} km "
+        f"with a {route['average_route_risk'] * 100:.0f}% average risk."
+    )
+    return DispatchAssistantResponse(
+        **parsed,
+        **route,
+        safety_score=1.0 - route["average_route_risk"],
+        tactical_summary=tactical_summary,
     )
