@@ -50,8 +50,8 @@
             </p>
             <h1 class="mt-1 text-xl font-bold text-white">Terrain-aware dispatch</h1>
           </div>
-          <span class="rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs font-medium text-emerald-300">
-            Live network
+          <span id="connection-status" class="rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs font-medium text-emerald-300" role="status">
+            Online
           </span>
         </div>
 
@@ -109,6 +109,10 @@
 
     <script>
       const API_BASE = "http://127.0.0.1:8000/api";
+      const STORAGE_KEYS = {
+        network: "ner-sarthi.network",
+        routes: "ner-sarthi.routes",
+      };
       const map = L.map("map", { zoomControl: false }).setView([27.15, 88.5], 9);
       L.control.zoom({ position: "bottomright" }).addTo(map);
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -125,6 +129,44 @@
       const destinationSelect = document.getElementById("destination");
       const calculateButton = document.getElementById("calculate-route");
       const simulateButton = document.getElementById("simulate-hazard");
+      const connectionStatus = document.getElementById("connection-status");
+
+      function setConnectionStatus(isOffline) {
+        connectionStatus.textContent = isOffline
+          ? "⚡ OFFLINE MODE: Using Cached Terrain Map"
+          : "Online";
+        connectionStatus.className = isOffline
+          ? "rounded-full bg-amber-400/15 px-2.5 py-1 text-xs font-medium text-amber-200"
+          : "rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs font-medium text-emerald-300";
+        simulateButton.disabled = isOffline;
+      }
+
+      function readCache(key) {
+        try {
+          const value = localStorage.getItem(key);
+          return value ? JSON.parse(value) : null;
+        } catch (error) {
+          console.warn(`Unable to read cached data for ${key}`, error);
+          return null;
+        }
+      }
+
+      function writeCache(key, value) {
+        try {
+          localStorage.setItem(key, JSON.stringify(value));
+        } catch (error) {
+          console.warn(`Unable to cache data for ${key}`, error);
+        }
+      }
+
+      function cacheRoutePair(standard, safe) {
+        writeCache(STORAGE_KEYS.routes, {
+          origin: originSelect.value,
+          destination: destinationSelect.value,
+          standard,
+          safe,
+        });
+      }
 
       function showMessage(text, kind = "info") {
         const message = document.getElementById("message");
@@ -219,6 +261,17 @@
       async function calculateRoutes() {
         calculateButton.disabled = true;
         try {
+          const cachedRoutes = readCache(STORAGE_KEYS.routes);
+          if (!navigator.onLine) {
+            if (!cachedRoutes || !cachedRoutes.safe || !cachedRoutes.standard) {
+              throw new Error("No cached route is available for offline use.");
+            }
+            renderRoute(layers.standard, cachedRoutes.standard, "#60a5fa", 4);
+            renderRoute(layers.safe, cachedRoutes.safe, "#34d399", 5);
+            updateComparison(cachedRoutes.standard, cachedRoutes.safe);
+            showMessage("Showing the last calculated routes from local cache.");
+            return;
+          }
           const request = {
             origin: originSelect.value,
             destination: destinationSelect.value,
@@ -227,11 +280,20 @@
             fetchJson("/route", { method: "POST", body: JSON.stringify({ ...request, mode: "standard" }) }),
             fetchJson("/route", { method: "POST", body: JSON.stringify({ ...request, mode: "safe" }) }),
           ]);
+          cacheRoutePair(standard, safe);
           renderRoute(layers.standard, standard, "#60a5fa", 4);
           renderRoute(layers.safe, safe, "#34d399", 5);
           updateComparison(standard, safe);
         } catch (error) {
-          showMessage(error.message, "error");
+          const cachedRoutes = readCache(STORAGE_KEYS.routes);
+          if (cachedRoutes && cachedRoutes.standard && cachedRoutes.safe) {
+            renderRoute(layers.standard, cachedRoutes.standard, "#60a5fa", 4);
+            renderRoute(layers.safe, cachedRoutes.safe, "#34d399", 5);
+            updateComparison(cachedRoutes.standard, cachedRoutes.safe);
+            showMessage("Live route unavailable. Showing the last calculated routes from local cache.", "error");
+          } else {
+            showMessage(error.message, "error");
+          }
         } finally {
           calculateButton.disabled = false;
         }
@@ -240,6 +302,10 @@
       async function simulateHazard() {
         simulateButton.disabled = true;
         try {
+          if (!navigator.onLine) {
+            showMessage("Hazard simulation requires a network connection.", "error");
+            return;
+          }
           await fetchJson("/simulate-hazard", {
             method: "POST",
             body: JSON.stringify({
@@ -250,6 +316,7 @@
             }),
           });
           const network = await fetchJson("/network");
+          writeCache(STORAGE_KEYS.network, network);
           renderNetwork(network);
           showMessage("120 mm monsoon event applied to the Teesta valley.");
           await calculateRoutes();
@@ -262,10 +329,46 @@
 
       calculateButton.addEventListener("click", calculateRoutes);
       simulateButton.addEventListener("click", simulateHazard);
-      fetchJson("/network")
-        .then(renderNetwork)
-        .then(calculateRoutes)
-        .catch((error) => showMessage(`API unavailable: ${error.message}`, "error"));
+      window.addEventListener("offline", () => {
+        setConnectionStatus(true);
+        showMessage("⚡ OFFLINE MODE: Using Cached Terrain Map.");
+      });
+      window.addEventListener("online", () => {
+        setConnectionStatus(false);
+        showMessage("Connection restored. Live terrain data is available.");
+      });
+
+      const cachedNetwork = readCache(STORAGE_KEYS.network);
+      setConnectionStatus(!navigator.onLine);
+      if (cachedNetwork) {
+        renderNetwork(cachedNetwork);
+      }
+      if (navigator.onLine) {
+        fetchJson("/network")
+          .then((network) => {
+            writeCache(STORAGE_KEYS.network, network);
+            renderNetwork(network);
+            return calculateRoutes();
+          })
+          .catch((error) => {
+            if (!cachedNetwork) {
+              showMessage(`API unavailable and no cached terrain map exists: ${error.message}`, "error");
+            } else {
+              showMessage("API unavailable. Showing the cached terrain map.", "error");
+              calculateRoutes();
+            }
+          });
+      } else if (cachedNetwork) {
+        calculateRoutes();
+      } else {
+        showMessage("Offline and no cached terrain map is available.", "error");
+      }
+
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.register("./sw.js").catch((error) => {
+          console.warn("Service worker registration failed", error);
+        });
+      }
     </script>
   </body>
 </html>
